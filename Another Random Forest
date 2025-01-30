@@ -1,0 +1,150 @@
+# Load necessary libraries ------------------------------------------------
+library(tidyverse)
+library(sf)
+library(sp)
+library(lubridate)
+library(naniar)
+library(viridisLite)
+library(viridis)
+library(ggplot2)
+library(corrplot)
+library(randomForest)
+library(caret)
+library(Metrics)
+
+# Load dataset ------------------------------------------------------------
+df <- readRDS("Mozambique data_tutorial_STUDENTS_revised.rds")
+moz_shapefile_sf <- st_as_sf(df$moz_shapefile)
+
+# Prepare analysis data ---------------------------------------------------
+analysis_data <- df$analysis_data %>%
+  ungroup() %>%
+  mutate(date = make_date(year, month))  # Create proper date column
+
+# Variables to retain
+variables_to_keep <- c(
+  "district", "year", "month", "malaria_cases_u5", "diarr_cases_u5", 
+  "tmin", "tmax", "precipitation", "RH", "ndvi", "prop_poor", "prop_Rural", 
+  "prop_drinking_TreatedWater", "prop_Has_sleeping_mosquito_net", 
+  "prop_dwelling_sprayed_last_12_Months", "prop_uneducated", "number_of_doctors"
+)
+
+analysis_data_cleaned <- analysis_data %>%
+  select(all_of(variables_to_keep))
+
+# Handle missing values ---------------------------------------------------
+# Fill missing climate variables using district-level averages
+analysis_data_cleaned <- analysis_data_cleaned %>%
+  group_by(district) %>%
+  mutate(across(c(tmin, tmax, precipitation, RH, ndvi), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+# Split data into training, test, and evaluation sets ---------------------
+training_data <- analysis_data_cleaned %>%
+  filter(year < 2018 | (year == 2018 & month < 3)) %>%
+  drop_na(malaria_cases_u5, diarr_cases_u5)  # Remove missing target values
+
+test_data <- analysis_data_cleaned %>%
+  filter(year == 2018 & month >= 3 & month <= 6)
+
+evaluation_data <- analysis_data_cleaned %>%
+  filter(year == 2018 & month >= 7) %>%
+  drop_na(malaria_cases_u5, diarr_cases_u5)
+
+# Display dataset dimensions
+cat("Training data dimensions:", dim(training_data), "\n")
+cat("Test data dimensions:", dim(test_data), "\n")
+cat("Evaluation data dimensions:", dim(evaluation_data), "\n")
+
+# Exploratory Data Analysis (EDA) -----------------------------------------
+summary(training_data)
+
+# Compute correlation matrix for numeric variables
+numeric_vars <- training_data %>%
+  select(where(is.numeric), -year, -month)  # Exclude year and month
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+# Visualize correlation matrix
+corrplot(cor_matrix, method = "circle", type = "upper", tl.col = "black", tl.srt = 45)
+
+# Plot malaria and diarrhea cases for Angonia -----------------------------
+plot_data <- analysis_data %>%
+  filter(district == "angonia") %>%
+  select(date, malaria_cases_u5, diarr_cases_u5) %>%
+  pivot_longer(cols = c(malaria_cases_u5, diarr_cases_u5),
+               names_to = "case_type", values_to = "cases")
+
+ggplot(plot_data, aes(x = date, y = cases, color = case_type)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Malaria and Diarrhea Cases in Angonia",
+    x = "Date",
+    y = "Number of Cases (Under 5 Years)",
+    color = "Case Type"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Train Random Forest Model -----------------------------------------------
+predictors <- c("tmin", "tmax", "precipitation", "RH", "ndvi", 
+                "prop_poor", "prop_Rural", "prop_drinking_TreatedWater", 
+                "prop_Has_sleeping_mosquito_net", "prop_dwelling_sprayed_last_12_Months", 
+                "prop_uneducated", "number_of_doctors")
+
+X_train <- training_data %>%
+  select(all_of(predictors)) %>%
+  select(where(~ sum(is.na(.)) == 0))  # Remove predictors with NAs
+
+y_train <- training_data$malaria_cases_u5
+
+# Train Random Forest model
+rf_model <- randomForest(x = X_train, y = y_train, ntree = 500, importance = TRUE)
+
+# Print model summary
+print(rf_model)
+
+# Model Evaluation --------------------------------------------------------
+# Predict on training data
+train_predictions <- predict(rf_model, X_train)
+
+# Compute RMSE
+rmse_value <- rmse(y_train, train_predictions)
+cat("RMSE for Training Data:", rmse_value, "\n")
+
+# Predict malaria cases for test set
+test_X <- test_data %>%
+  select(all_of(predictors)) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))  # Handle missing predictors
+
+test_data$malaria_cases_u5_pred <- predict(rf_model, test_X)
+
+# Compare Actual vs. Predicted Malaria Cases for Angonia -----------------
+comparison_table <- training_data %>%
+  mutate(
+    Date = make_date(year, month),
+    Actual_Malaria_Cases = malaria_cases_u5,
+    Predicted_Malaria_Cases = predict(rf_model, X_train)
+  ) %>%
+  filter(district == "angonia") %>%
+  select(Date, Actual_Malaria_Cases, Predicted_Malaria_Cases)
+
+# Display the table
+print(comparison_table)
+
+# Plot Actual vs. Predicted Malaria Cases in Angonia ---------------------
+ggplot(comparison_table, aes(x = Date)) +
+  geom_line(aes(y = Actual_Malaria_Cases, color = "Actual"), size = 1) +
+  geom_line(aes(y = Predicted_Malaria_Cases, color = "Predicted"), size = 1, linetype = "dashed") +
+  labs(
+    title = "Actual vs. Predicted Malaria Cases in Angonia",
+    x = "Date",
+    y = "Number of Cases (Under 5 Years)",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
